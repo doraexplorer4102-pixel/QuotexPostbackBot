@@ -117,7 +117,7 @@ def deposit_keyboard():
 def reject_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Register with Our Link", url=AFFILIATE)],
-        [InlineKeyboardButton("🔄 Try Again", callback_data="registered")],
+        [InlineKeyboardButton("🔄 Try Again with Correct ID", callback_data="try_again")],
     ])
 
 async def notify_owner(text):
@@ -236,6 +236,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━━\n"
             "📋 *STEP 2 — Share your Trader ID*\n\n"
             "Please send me your *Quotex Trader ID*.\n\n"
+            "👉 Find it in your Quotex dashboard (top-right corner).\n\n"
+            "Just type and send your ID number 👇",
+            parse_mode="Markdown"
+        )
+
+    elif query.data == "try_again":
+        state["step"] = "awaiting_id"
+        await query.message.reply_text(
+            "🔄 *Please send your correct Trader ID*\n\n"
             "👉 Find it in your Quotex dashboard (top-right corner).\n\n"
             "Just type and send your ID number 👇",
             parse_mode="Markdown"
