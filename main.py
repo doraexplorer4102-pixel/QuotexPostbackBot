@@ -15,12 +15,20 @@ BOT_TOKEN   = os.getenv("BOT_TOKEN")
 OWNER_ID    = int(os.getenv("OWNER_ID", "0"))
 VIP_LINK    = os.getenv("VIP_LINK", "https://t.me/+H3isrme8c3BiNDg1")
 AFFILIATE   = "https://broker-qx.pro/sign-up/?lid=1504736"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # e.g. https://yourapp.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 MIN_DEPOSIT = 20
 
 user_state: dict = {}
 app = Flask(__name__)
 tg_app: Application = None
+
+# Single shared event loop
+loop = asyncio.new_event_loop()
+
+def run_async(coro):
+    """Run coroutine on shared loop from any thread."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=30)
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -100,6 +108,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Just type and send your ID number 👇",
             parse_mode="Markdown"
         )
+
     elif query.data == "deposited":
         dep = state.get("deposit", 0.0)
         if dep >= MIN_DEPOSIT:
@@ -150,11 +159,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def home():
     return "✅ Quotex VIP Bot Running"
 
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-def webhook():
+@app.route(f"/webhook/<token>", methods=["POST"])
+def webhook(token):
+    if token != BOT_TOKEN:
+        return Response("Forbidden", status=403)
     json_data = request.get_json(force=True)
     update = Update.de_json(json_data, tg_app.bot)
-    asyncio.run(tg_app.process_update(update))
+    # Process update on the shared event loop
+    run_async(tg_app.process_update(update))
     return Response("OK", status=200)
 
 @app.route("/postback")
@@ -166,7 +178,10 @@ def postback():
     country = data.get("country", "N/A")
 
     msg = f"🔥 QUOTEX POSTBACK\n\n👤 ID: {uid}\n🌍 {country}\n📌 {status}\n💰 ${sumdep}"
-    asyncio.run(notify_owner(msg))
+    try:
+        run_async(notify_owner(msg))
+    except Exception as e:
+        print("Postback notify error:", e)
 
     for chat_id, state in user_state.items():
         if state.get("trader_id") == uid:
@@ -183,48 +198,62 @@ def postback():
                         parse_mode="Markdown"
                     )
                     s["step"] = "done"
-                asyncio.run(send_vip())
+                try:
+                    run_async(send_vip())
+                except Exception as e:
+                    print("VIP send error:", e)
             break
 
     return "OK"
 
 # ─── REMINDER LOOP ────────────────────────────────────────────────────────────
 
+async def send_reminders():
+    bot = Bot(BOT_TOKEN)
+    now = datetime.now()
+    for chat_id, state in list(user_state.items()):
+        if state["step"] not in ("awaiting_deposit", "awaiting_deposit_verify"):
+            continue
+        last    = state.get("last_reminder") or now
+        elapsed = (now - last).total_seconds()
+        try:
+            if not state["first_reminder_sent"] and elapsed >= 1800:
+                state["first_reminder_sent"] = True
+                state["last_reminder"] = now
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(f"⚠️ *Don't miss out!*\n\n"
+                          f"Account *ID: {state['trader_id']}* still shows $0.\n\n"
+                          f"💰 Deposit *${MIN_DEPOSIT}* to unlock VIP! 🚀"),
+                    parse_mode="Markdown",
+                    reply_markup=deposit_keyboard()
+                )
+            elif state["first_reminder_sent"] and elapsed >= 10800:
+                state["last_reminder"] = now
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(f"🔔 *VIP Access Still Waiting!*\n\n"
+                          f"Account *ID: {state['trader_id']}* not funded yet.\n\n"
+                          f"💸 Just *${MIN_DEPOSIT}* and you're in! 📈"),
+                    parse_mode="Markdown",
+                    reply_markup=deposit_keyboard()
+                )
+        except Exception as e:
+            print(f"Reminder error {chat_id}:", e)
+
 def reminder_loop():
     while True:
         time.sleep(300)
-        async def send_reminders():
-            bot = Bot(BOT_TOKEN)
-            now = datetime.now()
-            for chat_id, state in list(user_state.items()):
-                if state["step"] not in ("awaiting_deposit", "awaiting_deposit_verify"):
-                    continue
-                last    = state.get("last_reminder") or now
-                elapsed = (now - last).total_seconds()
-                try:
-                    if not state["first_reminder_sent"] and elapsed >= 1800:
-                        state["first_reminder_sent"] = True
-                        state["last_reminder"] = now
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=(f"⚠️ *Don't miss out!*\n\nAccount *ID: {state['trader_id']}* still shows $0.\n\n"
-                                  f"💰 Deposit *${MIN_DEPOSIT}* to unlock VIP! 🚀"),
-                            parse_mode="Markdown", reply_markup=deposit_keyboard()
-                        )
-                    elif state["first_reminder_sent"] and elapsed >= 10800:
-                        state["last_reminder"] = now
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=(f"🔔 *VIP Access Still Waiting!*\n\nAccount *ID: {state['trader_id']}* not funded yet.\n\n"
-                                  f"💸 Just *${MIN_DEPOSIT}* and you're in! 📈"),
-                            parse_mode="Markdown", reply_markup=deposit_keyboard()
-                        )
-                except Exception as e:
-                    print(f"Reminder error {chat_id}:", e)
         try:
-            asyncio.run(send_reminders())
+            run_async(send_reminders())
         except Exception as e:
             print("Reminder loop error:", e)
+
+# ─── EVENT LOOP THREAD ────────────────────────────────────────────────────────
+
+def start_loop():
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
 
@@ -235,10 +264,21 @@ async def setup_bot():
     tg_app.add_handler(CallbackQueryHandler(button_handler))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     await tg_app.initialize()
-    await tg_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}")
-    print(f"✅ Webhook set: {WEBHOOK_URL}/webhook/{BOT_TOKEN}")
+    await tg_app.start()
+    webhook_addr = f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}"
+    await tg_app.bot.set_webhook(webhook_addr)
+    print(f"✅ Webhook set: {webhook_addr}")
 
 if __name__ == "__main__":
-    asyncio.run(setup_bot())
+    # Start the shared event loop in background
+    threading.Thread(target=start_loop, daemon=True).start()
+
+    # Setup bot on that loop
+    future = asyncio.run_coroutine_threadsafe(setup_bot(), loop)
+    future.result(timeout=30)
+
+    # Start reminder thread
     threading.Thread(target=reminder_loop, daemon=True).start()
+
+    # Start Flask
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
