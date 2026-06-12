@@ -9,34 +9,87 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-OWNER_ID    = int(os.getenv("OWNER_ID", "0"))
-VIP_LINK    = os.getenv("VIP_LINK", "https://t.me/+H3isrme8c3BiNDg1")
-AFFILIATE   = "https://broker-qx.pro/sign-up/?lid=1504736"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-MIN_DEPOSIT = 20
+BOT_TOKEN    = os.getenv("BOT_TOKEN")
+OWNER_ID     = int(os.getenv("OWNER_ID", "0"))
+VIP_LINK     = os.getenv("VIP_LINK", "https://t.me/+H3isrme8c3BiNDg1")
+AFFILIATE    = "https://broker-qx.pro/sign-up/?lid=1504736"
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:DEfYBWltENxssYQNpworlKPeKVSKUuyQ@acela.proxy.rlwy.net:19828/railway")
+MIN_DEPOSIT  = 20
 
 user_state: dict = {}
-# deposit_data[trader_id] = deposit_amount (filled by postback)
-deposit_data: dict = {}
-
 app = Flask(__name__)
 tg_app: Application = None
 loop = asyncio.new_event_loop()
+
+# ─── DATABASE ─────────────────────────────────────────────────────────────────
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    """Create tables if they don't exist."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS verified_traders (
+                    uid TEXT PRIMARY KEY,
+                    deposit FLOAT DEFAULT 0.0,
+                    status TEXT DEFAULT '',
+                    country TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            conn.commit()
+    print("✅ Database initialized")
+
+def db_save_trader(uid: str, deposit: float = 0.0, status: str = "", country: str = ""):
+    """Save or update a trader ID in the database."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO verified_traders (uid, deposit, status, country, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (uid) DO UPDATE SET
+                        deposit = GREATEST(verified_traders.deposit, EXCLUDED.deposit),
+                        status = EXCLUDED.status,
+                        updated_at = NOW()
+                """, (uid, deposit, status, country))
+                conn.commit()
+    except Exception as e:
+        print(f"DB save error: {e}")
+
+def db_get_trader(uid: str):
+    """Get trader by UID. Returns dict or None."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM verified_traders WHERE uid = %s", (uid,))
+                return cur.fetchone()
+    except Exception as e:
+        print(f"DB get error: {e}")
+        return None
+
+def db_trader_exists(uid: str) -> bool:
+    return db_get_trader(uid) is not None
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def run_async(coro):
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=30)
 
-def get_state(chat_id: int) -> dict:
+def get_state(chat_id):
     if chat_id not in user_state:
         user_state[chat_id] = {
-            "step": "start",
-            "trader_id": None,
-            "deposit": 0.0,
-            "last_reminder": None,
+            "step": "start", "trader_id": None,
+            "deposit": 0.0, "last_reminder": None,
             "first_reminder_sent": False,
         }
     return user_state[chat_id]
@@ -53,24 +106,112 @@ def deposit_keyboard():
         [InlineKeyboardButton("✅ I Have Deposited", callback_data="deposited")],
     ])
 
-async def notify_owner(text: str):
+def reject_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Register with Our Link", url=AFFILIATE)],
+        [InlineKeyboardButton("🔄 Try Again", callback_data="registered")],
+    ])
+
+async def notify_owner(text):
     try:
         await Bot(BOT_TOKEN).send_message(chat_id=OWNER_ID, text=text)
     except Exception as e:
         print("Owner notify error:", e)
 
-async def _grant_vip(message, state: dict, chat_id: int):
+async def grant_vip(message, state, chat_id):
     state["step"] = "done"
     await message.reply_text(
         "🎉 *Deposit Confirmed! Welcome to VIP!*\n\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Your deposit has been verified.\n\n"
-        f"🚀 Join the *Exclusive VIP Signals Group*:\n\n"
-        f"👉 {VIP_LINK}\n\n"
-        "Welcome to the winning team! 🏆",
+        f"🚀 Join our *Exclusive VIP Signals Group*:\n\n"
+        f"👉 {VIP_LINK}\n\nWelcome to the winning team! 🏆",
         parse_mode="Markdown"
     )
     await notify_owner(f"✅ VIP Granted\n👤 ID: {state['trader_id']}\n💰 ${state['deposit']}\n💬 Chat: {chat_id}")
+
+# ─── ID VERIFICATION ──────────────────────────────────────────────────────────
+
+async def verify_id_then_respond(uid: str, chat_id: int):
+    state = get_state(chat_id)
+    bot = Bot(BOT_TOKEN)
+
+    # Show checking message
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=f"🔍 *Verifying ID* `{uid}`*...*\n\nChecking with Quotex...",
+        parse_mode="Markdown"
+    )
+
+    # Check DB immediately first
+    trader = db_get_trader(uid)
+
+    # If not found, wait up to 30 seconds for postback
+    if not trader:
+        for _ in range(10):
+            await asyncio.sleep(3)
+            trader = db_get_trader(uid)
+            if trader:
+                break
+
+    if not trader:
+        # Not found in DB = not from your affiliate link
+        state["step"] = "start"
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=(
+                "❌ *ID Not Verified!*\n\n"
+                f"Trader ID `{uid}` was *not registered through our link*.\n\n"
+                "To get VIP access, you must sign up using our link.\n\n"
+                "👇 Register below and come back with your new ID:"
+            ),
+            parse_mode="Markdown",
+            reply_markup=reject_keyboard()
+        )
+        await notify_owner(f"❌ Unverified ID attempt\n👤 ID: {uid}\n💬 Chat: {chat_id}")
+        return
+
+    # ✅ ID verified!
+    dep = trader["deposit"] or 0.0
+    state["trader_id"] = uid
+    state["deposit"] = dep
+    state["last_reminder"] = datetime.now()
+    state["first_reminder_sent"] = False
+
+    if dep >= MIN_DEPOSIT:
+        state["step"] = "done"
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"✅ *ID `{uid}` verified!*\n\nDeposit already confirmed! Granting VIP... 🚀",
+            parse_mode="Markdown"
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🎉 *Welcome to VIP!*\n\n"
+                f"🚀 Join our *Exclusive VIP Signals Group*:\n\n"
+                f"👉 {VIP_LINK}\n\nWelcome to the winning team! 🏆"
+            ),
+            parse_mode="Markdown"
+        )
+        await notify_owner(f"✅ VIP Granted\n👤 ID: {uid}\n💰 ${dep}\n💬 Chat: {chat_id}")
+    else:
+        state["step"] = "awaiting_deposit"
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=(
+                f"✅ *ID `{uid}` verified!*\n\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                "📋 *STEP 3 — Fund Your Account*\n\n"
+                f"💰 Deposit minimum *${MIN_DEPOSIT}* to unlock VIP.\n\n"
+                "Click below once deposited ✅"
+            ),
+            parse_mode="Markdown",
+            reply_markup=deposit_keyboard()
+        )
+        await notify_owner(f"🆕 Verified User\n👤 ID: {uid}\n💬 Chat: {chat_id}")
 
 # ─── BOT HANDLERS ─────────────────────────────────────────────────────────────
 
@@ -80,10 +221,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.update({"step": "start", "first_reminder_sent": False, "last_reminder": datetime.now()})
     await update.message.reply_text(
         "👋 Welcome to *Quotex VIP Signals Bot!*\n\n"
-        "I'll guide you step by step to join our exclusive *VIP Signals Group* 🚀\n\n"
+        "I'll guide you step by step to join our *VIP Signals Group* 🚀\n\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         "📋 *STEP 1 — Register*\n\n"
-        "Click the button below to create your *FREE Quotex account* using our link.\n\n"
+        "Click below to create your *FREE Quotex account* using our link.\n\n"
         "⚠️ You *MUST* use our link to get VIP access!",
         parse_mode="Markdown",
         reply_markup=register_keyboard()
@@ -109,18 +250,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "deposited":
         uid = state.get("trader_id")
-        # Check latest deposit from postback data
-        dep = deposit_data.get(uid, 0.0)
+        trader = db_get_trader(uid)
+        dep = trader["deposit"] if trader else 0.0
         state["deposit"] = dep
-
         if dep >= MIN_DEPOSIT:
-            await _grant_vip(query.message, state, chat_id)
+            await grant_vip(query.message, state, chat_id)
         else:
             await query.message.reply_text(
                 "⏳ *Deposit Not Confirmed Yet*\n\n"
-                f"🔍 Account (*ID: {uid}*) shows: *${dep:.2f}*\n\n"
-                f"💡 Minimum required: *${MIN_DEPOSIT}*\n\n"
-                "Make sure you deposited at least $20 and try again in a minute.",
+                f"Account (*ID: {uid}*) shows: *${dep:.2f}*\n\n"
+                f"Minimum: *${MIN_DEPOSIT}*\n\n"
+                "Deposit at least $20 and try again in a minute.",
                 parse_mode="Markdown",
                 reply_markup=deposit_keyboard()
             )
@@ -137,40 +277,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-
-        uid = text
-        state["trader_id"] = uid
-        state["last_reminder"] = datetime.now()
-        state["first_reminder_sent"] = False
-
-        # Check if already deposited via postback
-        dep = deposit_data.get(uid, 0.0)
-        state["deposit"] = dep
-
-        if dep >= MIN_DEPOSIT:
-            # Already deposited — grant VIP immediately
-            state["step"] = "done"
-            await update.message.reply_text(
-                f"🎯 *Trader ID `{uid}` linked!*\n\n"
-                "✅ Deposit already confirmed!\n\nGiving you VIP access now... 🚀",
-                parse_mode="Markdown"
-            )
-            await _grant_vip(update.message, state, chat_id)
-        else:
-            # Not deposited yet — ask them to deposit
-            state["step"] = "awaiting_deposit"
-            await update.message.reply_text(
-                f"🎯 *Trader ID `{uid}` linked!* ✅\n\n"
-                "━━━━━━━━━━━━━━━━━━━\n"
-                "📋 *STEP 3 — Fund Your Account*\n\n"
-                f"💰 Deposit minimum *${MIN_DEPOSIT}* to unlock VIP access.\n\n"
-                "Once deposited, click the button below ✅",
-                parse_mode="Markdown",
-                reply_markup=deposit_keyboard()
-            )
-            await notify_owner(f"🆕 New User\n👤 ID: {uid}\n💬 Chat: {chat_id}")
+        state["step"] = "checking"
+        asyncio.run_coroutine_threadsafe(
+            verify_id_then_respond(text, chat_id), loop
+        )
     else:
-        await update.message.reply_text("👋 Use /start to begin or tap the buttons above.")
+        await update.message.reply_text("👋 Use /start to begin or tap a button above.")
 
 # ─── FLASK ROUTES ─────────────────────────────────────────────────────────────
 
@@ -195,11 +307,11 @@ def postback():
     sumdep  = float(data.get("sumdep", 0))
     country = data.get("country", "N/A")
 
-    if not uid:
+    if not uid or uid in ("{trader_id}", "{uid}"):
         return "OK"
 
-    # Save deposit amount
-    deposit_data[uid] = sumdep
+    # Save to DB permanently
+    db_save_trader(uid, sumdep, status, country)
 
     msg = f"🔥 QUOTEX POSTBACK\n\n👤 ID: {uid}\n🌍 {country}\n📌 {status}\n💰 ${sumdep}"
     try:
@@ -207,7 +319,7 @@ def postback():
     except Exception as e:
         print("Postback notify error:", e)
 
-    # If deposit confirmed — find user and send VIP automatically
+    # Auto-send VIP if deposit confirmed
     if sumdep >= MIN_DEPOSIT:
         for chat_id, state in user_state.items():
             if state.get("trader_id") == uid and state["step"] != "done":
@@ -218,8 +330,8 @@ def postback():
                         chat_id=cid,
                         text=(
                             "🎉 *Deposit Confirmed! Welcome to VIP!*\n\n"
-                            "✅ We received your deposit automatically!\n\n"
-                            f"🚀 Join VIP now:\n👉 {VIP_LINK}\n\nWelcome! 🏆"
+                            "✅ Deposit received!\n\n"
+                            f"🚀 Join VIP:\n👉 {VIP_LINK}\n\nWelcome! 🏆"
                         ),
                         parse_mode="Markdown"
                     )
@@ -231,15 +343,30 @@ def postback():
 
     return "OK"
 
-# ─── REMINDER LOOP ────────────────────────────────────────────────────────────
+# ─── ADMIN: manually add an old ID ───────────────────────────────────────────
+
+@app.route("/addid")
+def add_id():
+    """Secret route to manually add old IDs. 
+    Usage: /addid?uid=12345678&key=ADMIN_SECRET"""
+    key = request.args.get("key", "")
+    uid = request.args.get("uid", "").strip()
+    if key != os.getenv("ADMIN_KEY", "quotexadmin2024"):
+        return Response("Forbidden", status=403)
+    if not uid:
+        return "No uid provided"
+    db_save_trader(uid, 0.0, "manual", "")
+    return f"✅ ID {uid} added successfully"
+
+# ─── REMINDERS ────────────────────────────────────────────────────────────────
 
 async def send_reminders():
     bot = Bot(BOT_TOKEN)
     now = datetime.now()
     for chat_id, state in list(user_state.items()):
-        if state["step"] not in ("awaiting_deposit",):
+        if state["step"] != "awaiting_deposit":
             continue
-        last    = state.get("last_reminder") or now
+        last = state.get("last_reminder") or now
         elapsed = (now - last).total_seconds()
         try:
             if not state["first_reminder_sent"] and elapsed >= 1800:
@@ -248,17 +375,15 @@ async def send_reminders():
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(f"⚠️ *Don't miss out!*\n\n"
-                          f"Account *ID: {state['trader_id']}* still shows $0.\n\n"
-                          f"💰 Deposit *${MIN_DEPOSIT}* to unlock VIP! 🚀"),
+                          f"ID *{state['trader_id']}* — deposit *${MIN_DEPOSIT}* to unlock VIP! 🚀"),
                     parse_mode="Markdown", reply_markup=deposit_keyboard()
                 )
             elif state["first_reminder_sent"] and elapsed >= 10800:
                 state["last_reminder"] = now
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=(f"🔔 *VIP Access Still Waiting!*\n\n"
-                          f"Account *ID: {state['trader_id']}* not funded yet.\n\n"
-                          f"💸 Just *${MIN_DEPOSIT}* and you're in! 📈"),
+                    text=(f"🔔 *Still waiting!*\n\n"
+                          f"ID *{state['trader_id']}* — just *${MIN_DEPOSIT}* and you're in VIP! 📈"),
                     parse_mode="Markdown", reply_markup=deposit_keyboard()
                 )
         except Exception as e:
@@ -289,6 +414,7 @@ async def setup_bot():
     print(f"✅ Webhook set: {webhook_addr}")
 
 if __name__ == "__main__":
+    init_db()
     threading.Thread(target=start_loop, daemon=True).start()
     future = asyncio.run_coroutine_threadsafe(setup_bot(), loop)
     future.result(timeout=30)
