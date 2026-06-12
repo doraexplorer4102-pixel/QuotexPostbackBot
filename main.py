@@ -19,8 +19,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 MIN_DEPOSIT = 20
 
 user_state: dict = {}
-# verified_ids[uid] = {"deposit": float, "country": str}
-verified_ids: dict = {}
+# deposit_data[trader_id] = deposit_amount (filled by postback)
+deposit_data: dict = {}
 
 app = Flask(__name__)
 tg_app: Application = None
@@ -29,8 +29,6 @@ loop = asyncio.new_event_loop()
 def run_async(coro):
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result(timeout=30)
-
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def get_state(chat_id: int) -> dict:
     if chat_id not in user_state:
@@ -55,12 +53,6 @@ def deposit_keyboard():
         [InlineKeyboardButton("✅ I Have Deposited", callback_data="deposited")],
     ])
 
-def try_again_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Register with Correct Link", url=AFFILIATE)],
-        [InlineKeyboardButton("🔄 I Used Your Link — Check Again", callback_data="registered")],
-    ])
-
 async def notify_owner(text: str):
     try:
         await Bot(BOT_TOKEN).send_message(chat_id=OWNER_ID, text=text)
@@ -72,97 +64,13 @@ async def _grant_vip(message, state: dict, chat_id: int):
     await message.reply_text(
         "🎉 *Deposit Confirmed! Welcome to VIP!*\n\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Your account has been verified.\n\n"
+        "✅ Your deposit has been verified.\n\n"
         f"🚀 Join the *Exclusive VIP Signals Group*:\n\n"
         f"👉 {VIP_LINK}\n\n"
         "Welcome to the winning team! 🏆",
         parse_mode="Markdown"
     )
     await notify_owner(f"✅ VIP Granted\n👤 ID: {state['trader_id']}\n💰 ${state['deposit']}\n💬 Chat: {chat_id}")
-
-# ─── VERIFY ID WITH RETRY ─────────────────────────────────────────────────────
-
-async def check_id_with_retry(uid: str, chat_id: int):
-    """
-    Wait up to 2 minutes for Quotex postback to arrive for this UID.
-    Checks every 10 seconds.
-    """
-    state = get_state(chat_id)
-    bot = Bot(BOT_TOKEN)
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"⏳ *Checking your ID `{uid}`...*\n\n"
-            "Please wait while we verify your registration with Quotex.\n"
-            "This takes just a few seconds..."
-        ),
-        parse_mode="Markdown"
-    )
-
-    # Wait up to 2 minutes (12 checks × 10 seconds)
-    for attempt in range(3):
-        await asyncio.sleep(1)
-
-        if uid in verified_ids:
-            # ✅ ID verified — proceed
-            dep = verified_ids[uid].get("deposit", 0.0)
-            state["trader_id"] = uid
-            state["deposit"] = dep
-            state["last_reminder"] = datetime.now()
-            state["first_reminder_sent"] = False
-
-            if dep >= MIN_DEPOSIT:
-                state["step"] = "done"
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🎯 *Trader ID `{uid}` verified!*\n\n✅ Deposit already confirmed! Giving you VIP access now... 🚀",
-                    parse_mode="Markdown"
-                )
-                # Grant VIP
-                state["step"] = "done"
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "🎉 *Welcome to VIP!*\n\n"
-                        f"🚀 Join the *Exclusive VIP Signals Group*:\n\n"
-                        f"👉 {VIP_LINK}\n\nWelcome to the winning team! 🏆"
-                    ),
-                    parse_mode="Markdown"
-                )
-                await notify_owner(f"✅ VIP Granted\n👤 ID: {uid}\n💰 ${dep}\n💬 Chat: {chat_id}")
-            else:
-                state["step"] = "awaiting_deposit"
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🎯 *Trader ID `{uid}` verified!* ✅\n\n"
-                        "━━━━━━━━━━━━━━━━━━━\n"
-                        "📋 *STEP 3 — Fund Your Account*\n\n"
-                        f"💰 Deposit minimum *${MIN_DEPOSIT}* to unlock VIP access.\n\n"
-                        "Click below once deposited ✅"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=deposit_keyboard()
-                )
-                await notify_owner(f"🆕 Verified Registration\n👤 ID: {uid}\n💬 Chat: {chat_id}")
-            return
-
-    # ❌ After 3 seconds — still not found
-    state["step"] = "awaiting_id"
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "❌ *ID Not Found in Our System!*\n\n"
-            "━━━━━━━━━━━━━━━━━━━\n"
-            f"🔍 Trader ID `{uid}` was *not registered through our link*.\n\n"
-            "To get VIP access, you *must* create an account using our link.\n\n"
-            "👇 Click below to register with the correct link:"
-        ),
-        parse_mode="Markdown",
-        reply_markup=try_again_keyboard()
-    )
-    await notify_owner(f"⚠️ Unverified ID (3sec timeout)\n👤 ID: {uid}\n💬 Chat: {chat_id}")
 
 # ─── BOT HANDLERS ─────────────────────────────────────────────────────────────
 
@@ -201,19 +109,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "deposited":
         uid = state.get("trader_id")
-        dep = state.get("deposit", 0.0)
-        if uid and uid in verified_ids:
-            dep = verified_ids[uid].get("deposit", dep)
-            state["deposit"] = dep
+        # Check latest deposit from postback data
+        dep = deposit_data.get(uid, 0.0)
+        state["deposit"] = dep
+
         if dep >= MIN_DEPOSIT:
             await _grant_vip(query.message, state, chat_id)
         else:
             await query.message.reply_text(
-                "⏳ *Checking your deposit...*\n\n"
-                "Not confirmed yet on our system.\n\n"
-                f"🔍 Account (*ID: {state['trader_id']}*) shows: *${dep:.2f}*\n\n"
+                "⏳ *Deposit Not Confirmed Yet*\n\n"
+                f"🔍 Account (*ID: {uid}*) shows: *${dep:.2f}*\n\n"
                 f"💡 Minimum required: *${MIN_DEPOSIT}*\n\n"
-                "Please deposit and try again in a few minutes.",
+                "Make sure you deposited at least $20 and try again in a minute.",
                 parse_mode="Markdown",
                 reply_markup=deposit_keyboard()
             )
@@ -232,40 +139,36 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         uid = text
-        state["step"] = "checking"  # prevent duplicate submissions
+        state["trader_id"] = uid
+        state["last_reminder"] = datetime.now()
+        state["first_reminder_sent"] = False
 
-        # If already in verified_ids — no need to wait
-        if uid in verified_ids:
-            dep = verified_ids[uid].get("deposit", 0.0)
-            state["trader_id"] = uid
-            state["deposit"] = dep
-            state["last_reminder"] = datetime.now()
-            state["first_reminder_sent"] = False
-            if dep >= MIN_DEPOSIT:
-                state["step"] = "done"
-                await update.message.reply_text(
-                    f"🎯 *Trader ID `{uid}` verified!*\n\n✅ Deposit confirmed! Giving VIP now... 🚀",
-                    parse_mode="Markdown"
-                )
-                await _grant_vip(update.message, state, chat_id)
-            else:
-                state["step"] = "awaiting_deposit"
-                await update.message.reply_text(
-                    f"🎯 *Trader ID `{uid}` verified!* ✅\n\n"
-                    "━━━━━━━━━━━━━━━━━━━\n"
-                    "📋 *STEP 3 — Fund Your Account*\n\n"
-                    f"💰 Deposit minimum *${MIN_DEPOSIT}* to unlock VIP access.\n\n"
-                    "Click below once deposited ✅",
-                    parse_mode="Markdown",
-                    reply_markup=deposit_keyboard()
-                )
-                await notify_owner(f"🆕 Verified Registration\n👤 ID: {uid}\n💬 Chat: {chat_id}")
-        else:
-            # Not found yet — wait for postback (runs in background)
-            asyncio.run_coroutine_threadsafe(
-                check_id_with_retry(uid, chat_id), loop
+        # Check if already deposited via postback
+        dep = deposit_data.get(uid, 0.0)
+        state["deposit"] = dep
+
+        if dep >= MIN_DEPOSIT:
+            # Already deposited — grant VIP immediately
+            state["step"] = "done"
+            await update.message.reply_text(
+                f"🎯 *Trader ID `{uid}` linked!*\n\n"
+                "✅ Deposit already confirmed!\n\nGiving you VIP access now... 🚀",
+                parse_mode="Markdown"
             )
-
+            await _grant_vip(update.message, state, chat_id)
+        else:
+            # Not deposited yet — ask them to deposit
+            state["step"] = "awaiting_deposit"
+            await update.message.reply_text(
+                f"🎯 *Trader ID `{uid}` linked!* ✅\n\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                "📋 *STEP 3 — Fund Your Account*\n\n"
+                f"💰 Deposit minimum *${MIN_DEPOSIT}* to unlock VIP access.\n\n"
+                "Once deposited, click the button below ✅",
+                parse_mode="Markdown",
+                reply_markup=deposit_keyboard()
+            )
+            await notify_owner(f"🆕 New User\n👤 ID: {uid}\n💬 Chat: {chat_id}")
     else:
         await update.message.reply_text("👋 Use /start to begin or tap the buttons above.")
 
@@ -287,7 +190,7 @@ def webhook(token):
 @app.route("/postback")
 def postback():
     data    = request.args
-    uid     = data.get("uid", "")
+    uid     = data.get("uid", "").strip()
     status  = data.get("status", "")
     sumdep  = float(data.get("sumdep", 0))
     country = data.get("country", "N/A")
@@ -295,10 +198,8 @@ def postback():
     if not uid:
         return "OK"
 
-    # Save UID as verified (came via your affiliate link)
-    if uid not in verified_ids:
-        verified_ids[uid] = {"deposit": 0.0, "country": country}
-    verified_ids[uid]["deposit"] = sumdep
+    # Save deposit amount
+    deposit_data[uid] = sumdep
 
     msg = f"🔥 QUOTEX POSTBACK\n\n👤 ID: {uid}\n🌍 {country}\n📌 {status}\n💰 ${sumdep}"
     try:
@@ -306,22 +207,22 @@ def postback():
     except Exception as e:
         print("Postback notify error:", e)
 
-    # Auto-grant VIP if deposit received
+    # If deposit confirmed — find user and send VIP automatically
     if sumdep >= MIN_DEPOSIT:
         for chat_id, state in user_state.items():
             if state.get("trader_id") == uid and state["step"] != "done":
                 state["deposit"] = sumdep
-                async def send_vip(cid=chat_id, s=state):
+                state["step"] = "done"
+                async def send_vip(cid=chat_id):
                     await Bot(BOT_TOKEN).send_message(
                         chat_id=cid,
                         text=(
                             "🎉 *Deposit Confirmed! Welcome to VIP!*\n\n"
-                            "✅ We received your deposit!\n\n"
+                            "✅ We received your deposit automatically!\n\n"
                             f"🚀 Join VIP now:\n👉 {VIP_LINK}\n\nWelcome! 🏆"
                         ),
                         parse_mode="Markdown"
                     )
-                    s["step"] = "done"
                 try:
                     run_async(send_vip())
                 except Exception as e:
@@ -336,7 +237,7 @@ async def send_reminders():
     bot = Bot(BOT_TOKEN)
     now = datetime.now()
     for chat_id, state in list(user_state.items()):
-        if state["step"] not in ("awaiting_deposit", "awaiting_deposit_verify"):
+        if state["step"] not in ("awaiting_deposit",):
             continue
         last    = state.get("last_reminder") or now
         elapsed = (now - last).total_seconds()
@@ -371,13 +272,9 @@ def reminder_loop():
         except Exception as e:
             print("Reminder loop error:", e)
 
-# ─── EVENT LOOP THREAD ────────────────────────────────────────────────────────
-
 def start_loop():
     asyncio.set_event_loop(loop)
     loop.run_forever()
-
-# ─── STARTUP ──────────────────────────────────────────────────────────────────
 
 async def setup_bot():
     global tg_app
