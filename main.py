@@ -44,7 +44,7 @@ def get_db():
     host, port, user, password, database = parse_db_url(DATABASE_URL)
     return pg8000.native.Connection(
         host=host, port=port, user=user,
-        password=password, database=database, ssl_context=True
+        password=password, database=database, ssl_context=False
     )
 
 def init_db():
