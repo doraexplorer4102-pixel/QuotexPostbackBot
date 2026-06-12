@@ -296,12 +296,32 @@ def webhook(token):
 
 @app.route("/postback")
 def postback():
-    uid     = request.args.get("uid", "").strip()
-    status  = request.args.get("status", "")
-    sumdep  = float(request.args.get("sumdep", 0))
-    country = request.args.get("country", "N/A")
+    # Quotex encodes {trader_id} as %7Btrader_id%7D in the first uid param
+    # but also appends the REAL values as extra params at the end
+    # So we get all values and pick the real one (not a placeholder)
+    all_args = request.args
 
-    if not uid or uid in ("{trader_id}", "{uid}"):
+    def get_real(key):
+        val = all_args.get(key, "").strip()
+        # If value is a placeholder like {trader_id}, it means not substituted
+        if val.startswith("{") and val.endswith("}"):
+            return ""
+        return val
+
+    uid     = get_real("uid")
+    status  = get_real("status")
+    country = get_real("country") or "N/A"
+    try:
+        sumdep = float(get_real("sumdep") or 0)
+    except:
+        sumdep = 0.0
+
+    # Log all args for debugging
+    print(f"POSTBACK args: {dict(all_args)}")
+    print(f"POSTBACK parsed: uid={uid} status={status} sumdep={sumdep} country={country}")
+
+    if not uid or uid in ("{trader_id}", "{uid}", ""):
+        print("POSTBACK: no valid uid found, skipping")
         return "OK"
 
     db_save_trader(uid, sumdep, status, country)
