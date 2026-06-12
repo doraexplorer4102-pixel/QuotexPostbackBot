@@ -3,7 +3,13 @@ from flask import Flask, request
 from telegram import Bot
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
+
+owner = os.getenv("OWNER_ID")
+
+if not owner:
+    raise Exception("OWNER_ID variable not found in Railway")
+
+OWNER_ID = int(owner)
 
 bot = Bot(BOT_TOKEN)
 
