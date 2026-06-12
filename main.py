@@ -1,4 +1,5 @@
 import os
+import asyncio
 from flask import Flask, request
 from telegram import Bot
 
@@ -15,30 +16,38 @@ bot = Bot(BOT_TOKEN)
 
 app = Flask(__name__)
 
+
 @app.route("/")
 def home():
     return "Quotex Postback Bot Running"
+
 
 @app.route("/postback")
 def postback():
     data = request.args
 
     message = (
-        f"🔥 QUOTEX POSTBACK\n\n"
-        f"Trader ID: {data.get('uid')}\n"
-        f"Country: {data.get('country')}\n"
-        f"Status: {data.get('status')}\n"
-        f"FTD: {data.get('ftd')}\n"
-        f"Deposit: {data.get('sumdep')}\n"
-        f"Withdrawal: {data.get('sumwithdraw')}"
+        "🔥 QUOTEX POSTBACK\n\n"
+        f"👤 Trader ID: {data.get('uid', 'N/A')}\n"
+        f"🌍 Country: {data.get('country', 'N/A')}\n"
+        f"📌 Status: {data.get('status', 'N/A')}\n"
+        f"💰 Deposit: ${data.get('sumdep', '0')}\n"
+        f"💸 Withdrawal: ${data.get('sumwithdraw', '0')}"
     )
 
-    bot.send_message(
-        chat_id=OWNER_ID,
-        text=message
-    )
+    try:
+        asyncio.run(
+            bot.send_message(
+                chat_id=OWNER_ID,
+                text=message
+            )
+        )
+
+    except Exception as e:
+        print("Telegram Error:", e)
 
     return "OK"
+
 
 if __name__ == "__main__":
     app.run(
