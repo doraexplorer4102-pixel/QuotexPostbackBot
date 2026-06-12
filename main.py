@@ -9,8 +9,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import pg8000
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
@@ -29,7 +28,18 @@ loop = asyncio.new_event_loop()
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    import pg8000.dbapi2 as dbapi
+    # parse DATABASE_URL
+    url = DATABASE_URL.replace("postgresql://", "")
+    userpass, rest = url.split("@")
+    user, password = userpass.split(":")
+    hostport, database = rest.split("/")
+    if ":" in hostport:
+        host, port = hostport.split(":")
+        port = int(port)
+    else:
+        host, port = hostport, 5432
+    return dbapi.connect(host=host, port=port, user=user, password=password, database=database, ssl_context=True)
 
 def init_db():
     """Create tables if they don't exist."""
@@ -69,9 +79,12 @@ def db_get_trader(uid: str):
     """Get trader by UID. Returns dict or None."""
     try:
         with get_db() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM verified_traders WHERE uid = %s", (uid,))
-                return cur.fetchone()
+            with conn.cursor() as cur:
+                cur.execute("SELECT uid, deposit, status, country FROM verified_traders WHERE uid = %s", (uid,))
+                row = cur.fetchone()
+                if row:
+                    return {"uid": row[0], "deposit": row[1], "status": row[2], "country": row[3]}
+                return None
     except Exception as e:
         print(f"DB get error: {e}")
         return None
